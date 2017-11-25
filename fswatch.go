@@ -358,8 +358,33 @@ func IsChanged(path string) bool {
 	return false
 }
 
+func HasFilepathPrefix(path, prefix string) bool {
+	pathabs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	prefixabs, err := filepath.Abs(prefix)
+	if err != nil {
+		return false
+	}
+	isPathSep := func(c rune) bool {
+		return c == filepath.Separator
+	}
+	pathParts := strings.FieldsFunc(pathabs, isPathSep)
+	prefixParts := strings.FieldsFunc(prefixabs, isPathSep)
+	for i, pathPart := range pathParts {
+		if i >= len(prefixParts) {
+			break
+		}
+		if pathPart != prefixParts[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // visits here for in case of duplicate paths
-func WatchPathAndChildren(w *fsnotify.Watcher, paths []string, depth int, visits map[string]bool) error {
+func WatchPathAndChildren(w *fsnotify.Watcher, paths []string, depth int, ignoreDirs []string, visits map[string]bool) error {
 	if visits == nil {
 		visits = make(map[string]bool)
 	}
@@ -368,6 +393,12 @@ func WatchPathAndChildren(w *fsnotify.Watcher, paths []string, depth int, visits
 		if visits[dir] {
 			return nil
 		}
+		for _, ignoreDir := range ignoreDirs {
+			if HasFilepathPrefix(dir, ignoreDir) {
+				return nil
+			}
+		}
+
 		if err := w.Add(dir); err != nil {
 			if strings.Contains(err.Error(), "too many open files") {
 				log.Fatalf("Watch directory(%s) error: %v", dir, err)
@@ -504,9 +535,29 @@ func initFWConfig() {
 	fmt.Printf("Saved to %s\n", strconv.Quote(cfg))
 }
 
+type strSlice []string
+
+func (ss *strSlice) String() string {
+	return strings.Join([]string(*ss), ",")
+}
+
+func (ss *strSlice) Set(v string) error {
+	*ss = append(*ss, v)
+	return nil
+}
+
 func main() {
+	fmt.Println("hi")
+	var ignoreDirs strSlice
+	var directories strSlice
+	var patterns strSlice
+
 	version := flag.Bool("version", false, "Show version")
 	configfile := flag.String("config", FWCONFIG_YAML, "Specify config file")
+
+	flag.Var(&directories, "path", "Path to watch")
+	flag.Var(&ignoreDirs, "ignore", "Paths to ignore")
+	flag.Var(&patterns, "pattern", "Pattern to watch")
 	flag.Parse()
 
 	if *version {
@@ -517,6 +568,30 @@ func main() {
 	subCmd := flag.Arg(0)
 	var fwc FWConfig
 	var err error
+	cmdWithArgs := flag.Args()
+
+	if len(directories) > 0 || len(patterns) > 0 {
+		if len(cmdWithArgs) == 0 {
+			log.Fatal(errors.New("must specify command"))
+		}
+		subCmd = "start"
+		fwc = FWConfig{
+			WatchPaths: directories,
+			WatchDepth: 10,
+			Triggers: []TriggerEvent{
+				{
+					Name:     "flag",
+					Patterns: patterns,
+					Command:  strings.Join(cmdWithArgs, " "),
+					Shell:    true,
+				},
+			},
+		}
+		fwc, err = fixFWConfig(fwc)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	if subCmd == "" {
 		fwc, err = readFWConfig(*configfile, FWCONFIG_JSON)
 		if err == nil {
@@ -536,7 +611,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = WatchPathAndChildren(fsw, fwc.WatchPaths, fwc.WatchDepth, visits)
+		err = WatchPathAndChildren(fsw, fwc.WatchPaths, fwc.WatchDepth, ignoreDirs, visits)
 		if err != nil {
 			log.Println(err)
 		}
